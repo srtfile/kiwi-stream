@@ -1,0 +1,57 @@
+name: Build and Publish Docker Image
+
+# Triggers:
+#   - Every push to main branch
+#   - Manual trigger from GitHub Actions tab
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}   # → ghcr.io/srtfile/kiwi-stream
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    # Required permissions to push to GitHub Container Registry
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      # 1. Checkout the repo
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Log in to GitHub Container Registry
+      #    Uses GITHUB_TOKEN automatically — no secrets needed
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 3. Extract metadata (tags and labels)
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=sha-
+
+      # 4. Build and push the Docker image
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./deployment        # Dockerfile is in /deployment folder
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha         # Use GitHub Actions cache to speed up builds
+          cache-to: type=gha,mode=max
