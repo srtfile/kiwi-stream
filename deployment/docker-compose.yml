@@ -1,0 +1,25 @@
+version: "3.8"
+
+services:
+  # FlareSolverr — handles Cloudflare bypass
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    environment:
+      - LOG_LEVEL=info
+      - TZ=UTC
+    ports:
+      - "8191:8191"
+    restart: unless-stopped
+
+  # Kiwi Stream API
+  kiwi-api:
+    build: .
+    container_name: kiwi-api
+    ports:
+      - "8000:8000"
+    environment:
+      - FLARESOLVERR_URL=http://flaresolverr:8191/v1
+    depends_on:
+      - flaresolverr
+    restart: unless-stopped
