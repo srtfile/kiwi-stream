@@ -1,0 +1,129 @@
+name: Run Kiwi Stream API
+
+# Trigger manually from GitHub Actions tab
+# Pass mal_id and episode as inputs
+on:
+  workflow_dispatch:
+    inputs:
+      mal_id:
+        description: "MyAnimeList ID (e.g. 1535 for Death Note)"
+        required: true
+        default: "1535"
+      episode:
+        description: "Episode number"
+        required: true
+        default: "1"
+      audio:
+        description: "Audio type: sub or dub (optional)"
+        required: false
+        default: ""
+      quality:
+        description: "Quality: 360p, 720p, or 1080p (optional)"
+        required: false
+        default: ""
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+
+    # Run FlareSolverr as a service container
+    services:
+      flaresolverr:
+        image: ghcr.io/flaresolverr/flaresolverr:latest
+        ports:
+          - 8191:8191
+        options: >-
+          --health-cmd "curl -f http://localhost:8191/ || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install curl-cffi requests
+
+      - name: Wait for FlareSolverr
+        run: |
+          echo "Waiting for FlareSolverr..."
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8191/ > /dev/null; then
+              echo "FlareSolverr is ready!"
+              break
+            fi
+            echo "  Attempt $i/30..."
+            sleep 2
+          done
+
+      - name: Extract stream URLs
+        id: extract
+        run: |
+          # Build URL with optional filters
+          URL="http://localhost:8000/streams/${{ inputs.mal_id }}/${{ inputs.episode }}"
+          PARAMS=""
+          if [ -n "${{ inputs.audio }}" ]; then
+            PARAMS="?audio=${{ inputs.audio }}"
+          fi
+          if [ -n "${{ inputs.quality }}" ]; then
+            if [ -n "$PARAMS" ]; then
+              PARAMS="${PARAMS}&quality=${{ inputs.quality }}"
+            else
+              PARAMS="?quality=${{ inputs.quality }}"
+            fi
+          fi
+
+          # Run the extractor directly (uses FlareSolverr at localhost:8191)
+          python - <<'PYEOF'
+          import sys, json, os
+          sys.path.insert(0, 'deployment')
+
+          # Override FlareSolverr URL
+          import kiwi_extractor_flaresolverr as ext
+          ext.FLARESOLVERR_URL = "http://localhost:8191/v1"
+
+          mal_id = int("${{ inputs.mal_id }}")
+          episode = int("${{ inputs.episode }}")
+          audio = "${{ inputs.audio }}" or None
+          quality = "${{ inputs.quality }}" or None
+
+          result = ext.get_stream_urls(mal_id, episode, verbose=True)
+
+          # Apply filters
+          if audio and audio in result:
+              result = {audio: result[audio]}
+          if quality:
+              filtered = {}
+              for a, qs in result.items():
+                  if quality in qs:
+                      filtered[a] = {quality: qs[quality]}
+              result = filtered
+
+          print("\n" + "="*60)
+          print("RESULTS")
+          print("="*60)
+          print(json.dumps(result, indent=2))
+
+          # Save to file for artifact upload
+          with open("streams.json", "w") as f:
+              json.dump({"mal_id": mal_id, "episode": episode, "streams": result}, f, indent=2)
+          PYEOF
+
+      - name: Upload results as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: stream-urls-${{ inputs.mal_id }}-ep${{ inputs.episode }}
+          path: streams.json
+          retention-days: 7
+
+      - name: Show results
+        run: |
+          echo "Stream URLs saved to artifact: stream-urls-${{ inputs.mal_id }}-ep${{ inputs.episode }}"
+          cat streams.json
