@@ -174,9 +174,10 @@ def get_kwik_url(pahe_url, verbose=True):
 
 def get_mp4_url_via_flaresolverr(kwik_f_url, session_id, verbose=True):
     """
-    Use FlareSolverr to:
-      1. GET /f/<id>  →  CF solved, extract _token
-      2. POST /d/<id> with _token  →  vault mp4 URL
+    1. FlareSolverr GET /f/<id>  →  CF solved, get _token + cookies
+    2. curl-cffi POST /d/<id>    →  capture 302 Location = vault mp4 URL
+       (FlareSolverr cannot be used for POST because it follows redirects
+        and loses the Location header — curl-cffi captures it directly)
     """
     if verbose:
         print(f"    FlareSolverr GET → {kwik_f_url}")
@@ -198,35 +199,49 @@ def get_mp4_url_via_flaresolverr(kwik_f_url, session_id, verbose=True):
     if verbose:
         print(f"    token: {token[:20]}...")
 
-    # POST to /d/
+    # POST to /d/ using curl-cffi (NOT FlareSolverr) so we get the 302 Location
     kwik_d_url = kwik_f_url.replace('/f/', '/d/')
     if verbose:
-        print(f"    FlareSolverr POST → {kwik_d_url}")
+        print(f"    curl-cffi POST → {kwik_d_url}")
 
-    _, post_body = fs_post(
+    resp = cffi_requests.post(
         kwik_d_url,
-        post_data={"_token": token},
+        headers={
+            "User-Agent": UA,
+            "Referer": kwik_f_url,
+            "Origin": "https://kwik.cx",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "sec-fetch-dest": "document",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-site": "same-origin",
+            "sec-fetch-user": "?1",
+            "upgrade-insecure-requests": "1",
+            "cache-control": "max-age=0",
+        },
         cookies=cookies,
-        referer=kwik_f_url,
-        session_id=session_id,
+        data={"_token": token},
+        impersonate="chrome131",
+        verify=False,
+        allow_redirects=False,  # CRITICAL: capture 302 Location, don't follow
+        timeout=20,
     )
 
-    # The POST response body should contain the vault URL (after redirect)
-    vault = re.search(r'https://vault-\d+\.uwucdn\.top/mp4/[^\s\'"<>]+', post_body)
+    # The vault URL is in the Location header of the 302 response
+    location = resp.headers.get('location', '')
+    if location and 'vault' in location:
+        return location
+
+    # Fallback: check body
+    vault = re.search(r'https://vault-\d+\.uwucdn\.top/mp4/[^\s\'"<>]+', resp.text)
     if vault:
         return vault.group(0)
 
-    # Also check for meta-refresh redirect
-    meta = re.search(
-        r'<meta[^>]+http-equiv=["\']refresh["\'][^>]+content=["\'][^"\']*url=\'?([^\'">\s]+)',
-        post_body, re.I
+    raise RuntimeError(
+        f"POST {kwik_d_url} → {resp.status_code}, no vault URL. "
+        f"Location: {location!r}. Body[:300]: {resp.text[:300]}"
     )
-    if meta:
-        url = meta.group(1).strip("'\"")
-        if 'vault' in url:
-            return url
-
-    raise RuntimeError(f"No vault URL in POST response. Body[:300]: {post_body[:300]}")
 
 
 # ── Step 5: mp4 → m3u8 ───────────────────────────────────────────────────────
