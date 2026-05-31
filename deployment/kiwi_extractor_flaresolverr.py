@@ -1,19 +1,336 @@
 """
-Kiwi Stream Extractor — FlareSolverr Version
-=============================================
-Uses FlareSolverr (Docker) to bypass Cloudflare on kwik.cx.
-This is the recommended approach for servers, Docker, GitHub Actions, etc.
+Kiwi Stream Extractor — Pure Python Version (No Browser Needed)
+===============================================================
+Uses kwik.cx/e/<id> endpoint which has NO Cloudflare protection.
+The /e/ ID is extracted from the /f/ page JS after solving CF once,
+OR derived from the /f/ page using FlareSolverr for the initial GET.
 
-FlareSolverr runs Chrome headlessly in a container and exposes an HTTP API.
-No browser needed on your machine.
+Flow:
+  1. mapper API  →  pahe short URLs
+  2. proxy       →  kwik.cx/f/<id>
+  3. FlareSolverr GET /f/<id>  →  extract /e/<id> from JS
+  4. curl-cffi GET /e/<id>     →  extract hash from obfuscated JS (NO CF)
+  5. Build mp4 + m3u8 URLs from hash
 
-Setup:
-  docker run -d --name flaresolverr -p 8191:8191 ghcr.io/flaresolverr/flaresolverr:latest
-
-Usage:
-  python kiwi_extractor_flaresolverr.py --mal-id 1535 --episode 1
-  python kiwi_extractor_flaresolverr.py --mal-id 1535 --episode 1 --json
+The /e/ endpoint works from any IP including GitHub Actions runners.
 """
+
+import re
+import sys
+import time
+import json
+import argparse
+
+import requests
+from curl_cffi import requests as cffi_requests
+
+MAPPER_API       = "https://mapper.nekostream.site/api/mal/{mal_id}/{episode}/{timestamp}"
+PROXY_URL        = "https://raspy-bread-20dd.animixplaycors.workers.dev/{code}"
+FLARESOLVERR_URL = "http://localhost:8191/v1"
+
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+CHROME_HEADERS = {
+    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "accept-language": "en-US,en;q=0.9",
+    "sec-fetch-dest": "document",
+    "sec-fetch-mode": "navigate",
+    "sec-fetch-site": "cross-site",
+    "sec-fetch-user": "?1",
+    "upgrade-insecure-requests": "1",
+    "user-agent": UA,
+}
+
+
+# ── FlareSolverr ──────────────────────────────────────────────────────────────
+
+def fs_create_session():
+    resp = requests.post(FLARESOLVERR_URL, json={"cmd": "sessions.create"}, timeout=30)
+    return resp.json()["session"]
+
+def fs_destroy_session(sid):
+    requests.post(FLARESOLVERR_URL, json={"cmd": "sessions.destroy", "session": sid}, timeout=10)
+
+def fs_get(url, session_id=None, max_timeout=60000):
+    payload = {"cmd": "request.get", "url": url, "maxTimeout": max_timeout}
+    if session_id:
+        payload["session"] = session_id
+    resp = requests.post(FLARESOLVERR_URL, json=payload, timeout=max_timeout // 1000 + 10)
+    data = resp.json()
+    if data.get("status") != "ok":
+        raise RuntimeError(f"FlareSolverr error: {data.get('message', data)}")
+    solution = data["solution"]
+    cookies = {c["name"]: c["value"] for c in solution.get("cookies", [])}
+    return solution["url"], solution["response"], cookies
+
+def check_flaresolverr():
+    try:
+        resp = requests.get(FLARESOLVERR_URL.replace("/v1", ""), timeout=5)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+# ── Step 1: mapper API ────────────────────────────────────────────────────────
+
+def call_mapper_api(mal_id, episode, timestamp):
+    url = MAPPER_API.format(mal_id=mal_id, episode=episode, timestamp=timestamp)
+    resp = cffi_requests.get(url, headers={"User-Agent": UA},
+                             impersonate="chrome131", verify=False, timeout=20)
+    return json.loads(resp.text)
+
+
+# ── Step 2: pahe → kwik.cx/f/<id> ────────────────────────────────────────────
+
+def get_kwik_url(pahe_url, verbose=True):
+    code = pahe_url.rstrip("/").split("/")[-1]
+    proxy_url = PROXY_URL.format(code=code)
+    if verbose:
+        print(f"    proxy → {proxy_url}")
+    resp = cffi_requests.get(
+        proxy_url,
+        headers={**CHROME_HEADERS, "referer": "https://pahe.nekostream.site/"},
+        impersonate="chrome131", verify=False, timeout=20, allow_redirects=True,
+    )
+    final_url = resp.url
+    if "kwik.cx" in final_url:
+        kwik_url = final_url
+    else:
+        m = re.search(r'https?://kwik\.cx/[^\s\'"<>]+', resp.text)
+        kwik_url = m.group(0) if m else None
+        if not kwik_url:
+            raise RuntimeError(f"No kwik.cx URL. Final: {final_url}")
+    return re.sub(r'kwik\.cx/[ed]/', 'kwik.cx/f/', kwik_url)
+
+
+# ── Step 3: /f/ → /e/ ID via FlareSolverr ────────────────────────────────────
+
+def get_e_id_from_f(kwik_f_url, session_id, verbose=True):
+    """
+    Use FlareSolverr to GET /f/<id> (solves CF).
+    Extract the /e/<id> from the page HTML/JS.
+    The /e/ ID appears in the page as an iframe src or JS variable.
+    """
+    if verbose:
+        print(f"    FlareSolverr GET /f/ → {kwik_f_url}")
+
+    _, body, _ = fs_get(kwik_f_url, session_id=session_id)
+
+    # Look for /e/<id> in the page
+    e_match = re.search(r'kwik\.cx/e/([a-zA-Z0-9]+)', body)
+    if e_match:
+        return e_match.group(1)
+
+    # Also check for embed URL patterns
+    e_match2 = re.search(r'/e/([a-zA-Z0-9]{8,})', body)
+    if e_match2:
+        return e_match2.group(1)
+
+    # Fallback: try to get _token and POST to /d/ to get the vault URL directly
+    token_match = re.search(
+        r'<input[^>]+name=["\']_token["\'][^>]+value=["\']([^"\']+)["\']', body, re.I
+    )
+    if not token_match:
+        token_match = re.search(
+            r'value=["\']([^"\']+)["\'][^>]+name=["\']_token["\']', body, re.I
+        )
+
+    if token_match:
+        # Use token + curl-cffi POST to get vault URL
+        return None, token_match.group(1), body
+
+    raise RuntimeError(f"/e/ ID not found in /f/ page: {kwik_f_url}")
+
+
+# ── Step 4: GET /e/<id> → extract hash (NO Cloudflare) ───────────────────────
+
+def get_urls_from_e(e_id, verbose=True):
+    """
+    GET kwik.cx/e/<id> — NO Cloudflare protection.
+    Extract the vault hash from the obfuscated JS.
+    Returns (mp4_url, m3u8_url).
+    """
+    url = f"https://kwik.cx/e/{e_id}"
+    if verbose:
+        print(f"    GET /e/ (no CF) → {url}")
+
+    resp = cffi_requests.get(
+        url,
+        headers={
+            "User-Agent": UA,
+            "Referer": "https://kwik.cx/",
+            "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+        },
+        impersonate="chrome131",
+        verify=False,
+        timeout=20,
+    )
+
+    if resp.status_code != 200:
+        raise RuntimeError(f"/e/ returned {resp.status_code}")
+
+    # Extract hash from obfuscated JS
+    # Pattern: <hash>|06|stream|top|uwucdn|vault|https
+    hash_match = re.search(
+        r'([a-f0-9]{60,})\|06\|stream\|top\|uwucdn\|vault\|https',
+        resp.text
+    )
+    if not hash_match:
+        raise RuntimeError(f"Hash not found in /e/ page: {url}")
+
+    h = hash_match.group(1)
+    mp4_url  = f"https://vault-11.uwucdn.top/mp4/11/06/{h}"
+    m3u8_url = f"https://vault-11.uwucdn.top/stream/11/06/{h}/uwu.m3u8"
+    return mp4_url, m3u8_url
+
+
+# ── Main extractor ────────────────────────────────────────────────────────────
+
+def get_stream_urls(mal_id, episode, timestamp=None, verbose=True):
+    if timestamp is None:
+        timestamp = int(time.time())
+
+    if not check_flaresolverr():
+        raise RuntimeError(
+            "FlareSolverr is not running!\n"
+            "Start: docker run -d --name flaresolverr -p 8191:8191 "
+            "ghcr.io/flaresolverr/flaresolverr:latest"
+        )
+
+    session_id = fs_create_session()
+    if verbose:
+        print(f"[FlareSolverr] Session: {session_id}")
+
+    try:
+        api_url = MAPPER_API.format(mal_id=mal_id, episode=episode, timestamp=timestamp)
+        if verbose:
+            print(f"\n[1] Mapper API: {api_url}")
+
+        api_data = call_mapper_api(mal_id, episode, timestamp)
+        kiwi = api_data.get("Kiwi-Stream")
+        if not kiwi:
+            raise RuntimeError("No 'Kiwi-Stream' in API response")
+
+        results = {}
+
+        for audio_type in ("sub", "dub"):
+            if audio_type not in kiwi:
+                continue
+            results[audio_type] = {}
+
+            for quality_key, pahe_url in kiwi[audio_type].get("download", {}).items():
+                quality = quality_key.replace("Kiwi-Stream-", "")
+                if verbose:
+                    print(f"\n[2] {audio_type} {quality}: {pahe_url}")
+
+                try:
+                    # Step 2: pahe → kwik /f/ URL
+                    kwik_f_url = get_kwik_url(pahe_url, verbose=verbose)
+                    if verbose:
+                        print(f"    kwik /f/: {kwik_f_url}")
+
+                    # Step 3: FlareSolverr GET /f/ → get /e/ ID
+                    result = get_e_id_from_f(kwik_f_url, session_id, verbose=verbose)
+
+                    if isinstance(result, tuple):
+                        # Fallback: got token instead of /e/ ID
+                        _, token, body = result
+                        # Use curl-cffi POST to /d/
+                        kwik_d_url = kwik_f_url.replace('/f/', '/d/')
+                        cookies = {}  # no cookies available in this path
+                        r = cffi_requests.post(
+                            kwik_d_url,
+                            headers={"User-Agent": UA, "Referer": kwik_f_url,
+                                     "Origin": "https://kwik.cx",
+                                     "Content-Type": "application/x-www-form-urlencoded"},
+                            data={"_token": token},
+                            impersonate="chrome131", verify=False,
+                            allow_redirects=False, timeout=20,
+                        )
+                        location = r.headers.get('location', '')
+                        if location and 'vault' in location:
+                            mp4_url = location
+                            m3u8_url = mp4_to_m3u8(mp4_url)
+                        else:
+                            raise RuntimeError(f"POST /d/ failed: {r.status_code}")
+                    else:
+                        e_id = result
+                        if verbose:
+                            print(f"    /e/ ID: {e_id}")
+
+                        # Step 4: GET /e/ (no CF) → extract hash
+                        mp4_url, m3u8_url = get_urls_from_e(e_id, verbose=verbose)
+
+                    if verbose:
+                        print(f"    mp4:  {mp4_url}")
+                        print(f"    m3u8: {m3u8_url}")
+
+                    results[audio_type][quality] = {"mp4": mp4_url, "m3u8": m3u8_url}
+
+                except Exception as exc:
+                    if verbose:
+                        print(f"    ERROR: {exc}")
+                    results[audio_type][quality] = {"error": str(exc)}
+
+    finally:
+        fs_destroy_session(session_id)
+        if verbose:
+            print("\n[FlareSolverr] Session destroyed")
+
+    return results
+
+
+def mp4_to_m3u8(mp4_url):
+    m = re.search(r'(vault-\d+\.uwucdn\.top)/mp4/(.+?)(?:\?|$)', mp4_url)
+    if not m:
+        raise RuntimeError(f"Cannot derive m3u8 from: {mp4_url}")
+    return f"https://{m.group(1)}/stream/{m.group(2)}/uwu.m3u8"
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Kiwi Stream Extractor")
+    parser.add_argument("--mal-id",    type=int, default=1535)
+    parser.add_argument("--episode",   type=int, default=1)
+    parser.add_argument("--timestamp", type=int, default=None)
+    parser.add_argument("--json",      action="store_true")
+    parser.add_argument("--flaresolverr-url", default="http://localhost:8191/v1")
+    args = parser.parse_args()
+
+    global FLARESOLVERR_URL
+    FLARESOLVERR_URL = args.flaresolverr_url
+
+    verbose = not args.json
+
+    try:
+        urls = get_stream_urls(args.mal_id, args.episode, args.timestamp, verbose=verbose)
+    except Exception as exc:
+        print(f"Fatal error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.json:
+        print(json.dumps(urls, indent=2))
+    else:
+        print("\n" + "=" * 60)
+        print("RESULTS")
+        print("=" * 60)
+        for audio_type, qualities in urls.items():
+            print(f"\n  [{audio_type.upper()}]")
+            for quality, links in qualities.items():
+                print(f"    {quality}:")
+                if "error" in links:
+                    print(f"      ERROR: {links['error']}")
+                else:
+                    print(f"      mp4:  {links['mp4']}")
+                    print(f"      m3u8: {links['m3u8']}")
+
+if __name__ == "__main__":
+    main()
 
 import re
 import sys
